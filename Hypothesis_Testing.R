@@ -188,9 +188,6 @@ print(p_value_plot)
 # 7. EFFECT SIZE CALCULATION (For T-Tests)
 # ----------------------------------------------------------------------------
 
-cat("EFFECT SIZES (Cohen's d for numerical features)\n")
-cat("=" , rep("=", 60), "\n", sep = "")
-
 # Function to calculate Cohen's d
 calculate_cohens_d <- function(data, feature, target) {
   groups <- split(data[[feature]], data[[target]])
@@ -212,8 +209,8 @@ calculate_cohens_d <- function(data, feature, target) {
   
   # Interpret effect size
   effect_interpretation <- ifelse(abs(cohens_d) < 0.2, "Negligible",
-                                  ifelse(abs(cohens_d) < 0.5, "Small",
-                                         ifelse(abs(cohens_d) < 0.8, "Medium", "Large")))
+                           ifelse(abs(cohens_d) < 0.5, "Small",
+                           ifelse(abs(cohens_d) < 0.8, "Medium", "Large")))
   
   return(data.frame(
     Feature = feature,
@@ -241,4 +238,47 @@ for (feature in numerical_features) {
   })
 }
 
+# ----------------------------------------------------------------------------
+# 7. EFFECT SIZE CALCULATION (For CHI-SQUARE Tests)
+# ----------------------------------------------------------------------------
 
+# Function to calculate Cramér's V
+calculate_cramers_v <- function(data, feature, target) {
+  contingency_table <- table(data[[feature]], data[[target]])
+  chi2 <- chisq.test(contingency_table)$statistic
+  n <- sum(contingency_table)
+  
+  # Degrees of freedom for the denominator
+  min_dim <- min(dim(contingency_table)) - 1
+  
+  v_stat <- sqrt(chi2 / (n * min_dim))
+  
+  # Interpret effect size
+  interpretation <- ifelse(v_stat < 0.1, "Negligible",
+                    ifelse(v_stat < 0.3, "Small",
+                    ifelse(v_stat < 0.5, "Medium", "Large")))
+  
+  return(data.frame(
+    Feature = feature,
+    Cramers_V = round(v_stat, 3),
+    Effect_Size = interpretation
+  ))
+}
+
+# Example loop for your categorical features
+effect_sizes <- data.frame()
+
+cat("Effect Size Interpretation:\n
+    |d| < 0.1: Negligible effect\n
+    0.1 ≤ |d| < 0.3: Small effect\n
+    0.3 ≤ |d| < 0.5: Medium effect\n
+    |d| ≥ 0.5: Large effect\n")
+
+# Calculate effect sizes for categorical features
+categorical_effects <- data.frame()
+for (feature in categorical_features) {
+  eff <- calculate_cramers_v(df, feature, "income_level")
+  categorical_effects <- rbind(categorical_effects, eff)
+  cat(sprintf("%-20s | Cramér's V: %6.3f | Effect: %s\n", 
+              feature, eff$Cramers_V, eff$Effect_Size))
+}
