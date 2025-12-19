@@ -365,7 +365,7 @@ for (feature in numerical_features) {
 }
 
 # ----------------------------------------------------------------------------
-# . EFFECT SIZE CALCULATION (For CHI-SQUARE Tests)
+# 8. EFFECT SIZE CALCULATION (For CHI-SQUARE Tests)
 
 # Function to calculate Cramér's V
 calculate_cramers_v <- function(data, feature, target) {
@@ -390,7 +390,6 @@ calculate_cramers_v <- function(data, feature, target) {
   ))
 }
 
-# Example loop for your categorical features
 effect_sizes <- data.frame()
 
 cat("Effect Size Interpretation:\n
@@ -408,11 +407,64 @@ for (feature in categorical_features) {
               feature, eff$Cramers_V, eff$Effect_Size))
 }
 
+
+# ----------------------------------------------------------------------------
+# 9. Visualize CHI SQUARE Results
+
+
+chi_vis <- chi_square_results %>%
+  arrange(desc(Statistic)) %>%
+  mutate(
+    P_Label = ifelse(P_Value < 0.001, "<0.001", sprintf("%.3f", P_Value)),
+    Sig_Label = ifelse(Significant, "***", "")
+  )
+
+ggplot(chi_vis,
+       aes(x = reorder(Feature, Statistic),
+           y = Statistic,
+           fill = Feature)) +       # map fill to Feature
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Chi-Square Statistics: Categorical Features vs Income",
+    x = "Feature",
+    y = "Chi-Square Statistic"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")  # hide legend if too many features
+
+
+# ----------------------------------------------------------------------------
+# 10. Visualize T-TEST Results
+
+t_vis <- t_test_results %>%
+  mutate(
+    Abs_T = abs(Statistic),
+    P_Label = ifelse(P_Value < 0.001, "<0.001", sprintf("%.3f", P_Value)),
+    Sig_Label = ifelse(Significant, "***", "")
+  ) %>%
+  arrange(desc(Abs_T))
+
+ggplot(t_vis,
+       aes(x = reorder(Feature, Abs_T),
+           y = Abs_T,
+           fill = Feature)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "T-Statistics: Numerical Features vs Income",
+    x = "Feature",
+    y = "Absolute T-Statistic"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
 # ============================================================
 # 4) EDA helpers (optional, TRAIN ONLY)
 # ============================================================
 
-# 4.1) Missingness summary
+# 4.1) Missingn summary
 missing_summary <- train_data %>%
   summarise(across(everything(), ~ sum(is.na(.x)))) %>%
   pivot_longer(everything(), names_to = "column", values_to = "na_count") %>%
