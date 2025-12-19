@@ -1,406 +1,1038 @@
-# Project: Adult Income Prediction Dataset
-# Description: Complete data cleaning and preprocessing pipeline for income prediction
-# =============================================================================
+## ============================================================
+# Adult dataset — Preprocessing + Recipes (Leakage-safe)
+# Models: Logistic Regression, Naive Bayes, Random Forest
+# ============================================================
 
-# =============================================================================
-# 1. INSTALL AND LOAD REQUIRED PACKAGES
-# =============================================================================
-
-# Install packages if not already installed
-if (!require(tidyverse)) install.packages("tidyverse")
-if (!require(caret)) install.packages("caret")
-if (!require(naniar)) install.packages("naniar")
-
-# Load libraries
-library(tidyverse)   # For data manipulation and visualization
-library(caret)       # For machine learning utilities and preprocessing
-library(naniar)      # For missing value visualization
-
-cat("=== PACKAGES LOADED SUCCESSFULLY ===\n")
-
-# =============================================================================
-# 2. LOAD AND INITIAL INSPECTION OF RAW DATA
-# =============================================================================
-
-# Load the dataset from CSV file
-df <- read_csv("adult.csv")
-
-cat("=== INITIAL DATA INSPECTION ===\n")
-
-# Display dataset structure: shows column names, types, and sample data
-cat("\n1. Dataset Structure:\n")
-str(df)
-
-# Generate statistical summary: min, max, mean, quartiles for numerical variables
-cat("\n2. Statistical Summary:\n")
-print(summary(df))
-
-# =============================================================================
-# 3. CLEAN COLUMN NAMES FOR CONSISTENCY
-# =============================================================================
-
-cat("\n=== CLEANING COLUMN NAMES ===\n")
-
-# Clean column names: convert to lowercase, remove special characters, replace dots with underscores
-df <- df %>%
-  rename_with(~tolower(gsub("[^[:alnum:]_\\.]", "", .))) %>%  # Remove special chars
-  rename_with(~gsub("\\.", "_", .))  # Replace dots with underscores
-
-cat("Column names after cleaning:\n")
-print(names(df))
-
-# =============================================================================
-# 4. HANDLE MISSING VALUES (CONVERT "?" TO NA)
-# =============================================================================
-
-cat("\n=== HANDLING MISSING VALUES ===\n")
-
-# Convert "?" to NA (proper missing value representation) for all character columns
-df_clean <- df %>%
-  mutate(across(where(is.character), ~na_if(., "?")))
-
-cat("Converted '?' to NA for proper missing value handling.\n")
-
-# =============================================================================
-# 5. ANALYZE MISSING VALUES
-# =============================================================================
-
-# Calculate percentage of missing values for each variable
-missing_summary <- df_clean %>%
-  summarise(across(everything(), ~sum(is.na(.))/n())) %>%
-  pivot_longer(everything(), names_to = "variable", values_to = "missing_pct")
-
-cat("\nMissing Values Analysis:\n")
-print(missing_summary)
-
-# =============================================================================
-# 6. IMPUTE MISSING VALUES
-# =============================================================================
-
-cat("\n=== IMPUTING MISSING VALUES ===\n")
-
-# Impute missing values using mode (most frequent value) for categorical variables
-df_clean <- df_clean %>%
-  mutate(
-    # For workclass: replace NA with most common workclass (mode imputation)
-    workclass = ifelse(is.na(workclass), 
-                       names(sort(table(workclass[!is.na(workclass)]), decreasing = TRUE))[1],
-                       workclass),
-    
-    # For occupation: replace NA with most common occupation (mode imputation)
-    occupation = ifelse(is.na(occupation),
-                        names(sort(table(occupation[!is.na(occupation)]), decreasing = TRUE))[1],
-                        occupation),
-    
-    # For native_country: replace NA with "United-States" (majority class imputation)
-    native_country = ifelse(is.na(native_country), "United-States", native_country)
-  )
-
-cat("Missing values imputed using mode imputation for categorical variables.\n")
-
-# Verify no missing values remain
-cat("\nMissing values after imputation:\n")
-print(df_clean %>% summarise(across(everything(), ~sum(is.na(.)))))
-
-# =============================================================================
-# 7. OUTLIER DETECTION AND HANDLING
-# =============================================================================
-
-cat("\n=== HANDLING OUTLIERS ===\n")
-
-# Define numerical variables for outlier analysis (using CORRECT column names)
-numerical_vars <- c("age", "fnlwgt", "capital_gain", "capital_loss", "hours_per_week")
-
-# Function to detect outliers using IQR method
-detect_outliers <- function(x) {
-  Q1 <- quantile(x, 0.25, na.rm = TRUE)
-  Q3 <- quantile(x, 0.75, na.rm = TRUE)
-  IQR <- Q3 - Q1
-  lower <- Q1 - 1.5 * IQR
-  upper <- Q3 + 1.5 * IQR
-  sum(x < lower | x > upper, na.rm = TRUE)
+# Helper: run a contiguous block of lines from a file (useful in notebooks)
+run_lines <- function(from, to, file = "Adult_Census.R") {
+  lines <- readLines(file, warn = FALSE)
+  code <- paste(lines[from:to], collapse = "\n")
+  cat("\n--- Running lines", from, "to", to, "---\n")
+  eval(parse(text = code), envir = .GlobalEnv)
 }
 
-# Count outliers for each numerical variable
-outliers_summary <- df_clean %>%
-  summarise(across(all_of(numerical_vars), detect_outliers))
+# -----------------------------
+# 0) Libraries + global options
+# -----------------------------
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tidymodels)
+  library(janitor)
+  library(stringr)
+  library(recipes)
+  library(glue)
+})
 
-cat("\nOutlier Counts (using IQR method):\n")
-print(outliers_summary)
+set.seed(404) # Ensures split/fold reproducibility
 
-# Cap extreme values (winsorization) instead of removal to preserve data
-df_clean <- df_clean %>%
+# -----------------------------
+# 0.1) User-configurable knobs
+# -----------------------------
+DATA_PATH <- "adult.csv"
+TARGET_COL <- "income"
+TEST_PROP <- 0.20
+V_FOLDS <- 5
+
+# -----------------------------
+# 0.2) Output locations
+# -----------------------------
+OUTPUT_DIR <- "outputs"
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "data"), showWarnings = FALSE, recursive = TRUE)
+
+# Make yardstick treat the SECOND factor level as the "event"/positive class.
+# We'll set income_level levels as: low_income, high_income => high_income is positive.
+options(yardstick.event_first = FALSE)
+
+# ===========
+# 1) Load + deterministic cleaning (safe globally)
+# ===========
+
+raw <- readr::read_csv(DATA_PATH, show_col_types = FALSE) %>%
+  janitor::clean_names()
+
+# Convert tokens to NA + trim
+raw <- raw %>%
+  mutate(across(where(is.character), ~ trimws(.x))) %>%
+  mutate(across(where(is.character), ~ na_if(.x, "?"))) %>%
+  mutate(across(where(is.character), ~ na_if(.x, "")))
+
+# Ensure target exists
+if (!TARGET_COL %in% names(raw)) {
+  stop(glue::glue(
+    "TARGET_COL='{TARGET_COL}' not found. Available: {paste(names(raw), collapse=', ')}"
+  ))
+}
+
+# 1.1) Duplicate diagnostics (before removal)
+n_total <- nrow(raw)
+n_dup_exact <- sum(duplicated(raw))
+n_unique <- dplyr::n_distinct(raw)
+
+cat("Total rows:", n_total, "\n")
+cat("Unique rows:", n_unique, "\n")
+cat("Exact duplicate rows:", n_dup_exact, "\n")
+
+dup_groups <- raw %>%
+  count(across(everything()), name = "freq") %>%
+  filter(freq > 1)
+
+cat("Duplicate groups:", nrow(dup_groups), "\n")
+cat(
+  "Max repeats of a single row:",
+  ifelse(nrow(dup_groups) == 0, 1, max(dup_groups$freq)),
+  "\n"
+)
+
+# 1.2) Remove exact duplicates (keeps 1 copy)
+raw <- raw %>% distinct()
+
+# -----------------------------
+# 2) Target inspection + clean mapping
+# -----------------------------
+cat("Unique values in target:\n")
+print(sort(unique(raw[[TARGET_COL]]), na.last = TRUE))
+
+cat("\nCounts per target value:\n")
+counts <- table(raw[[TARGET_COL]], useNA = "ifany")
+print(counts)
+
+cat("\nClass percentages (%):\n")
+pct <- prop.table(counts) * 100
+print(round(pct, 2))
+
+# Create a binary factor target:
+raw <- raw %>%
   mutate(
-    age = ifelse(age > 85, 85, age),                     # Cap age at 85 (99th percentile)
-    hours_per_week = ifelse(hours_per_week > 80, 80, hours_per_week),  # Cap hours at 80
-    capital_gain_log = log1p(capital_gain),             # Log transform for highly skewed data
-    capital_loss_log = log1p(capital_loss)              # Log transform for highly skewed data
-  )
-
-cat("Extreme values capped and log transformations applied for skewed variables.\n")
-
-# =============================================================================
-# 8. TARGET VARIABLE ANALYSIS
-# =============================================================================
-
-cat("\n=== ANALYZING TARGET VARIABLE ===\n")
-
-# Check class distribution in target variable (income)
-income_distribution <- df_clean %>%
-  count(income) %>%
-  mutate(percentage = n/sum(n) * 100)
-
-cat("\nIncome Class Distribution:\n")
-print(income_distribution)
-
-# =============================================================================
-# 9. ENCODE CATEGORICAL VARIABLES
-# =============================================================================
-
-cat("\n=== ENCODING CATEGORICAL VARIABLES ===\n")
-
-# Convert categorical variables to factors with explicit levels
-df_clean <- df_clean %>%
-  mutate(
-    # Convert target variable to ordered factor
-    income = factor(income, levels = c("<=50K", ">50K")),
-    
-    # Convert all categorical variables to factors
-    across(c(workclass, education, marital_status, occupation,
-             relationship, race, sex, native_country), as.factor)
-  )
-
-cat("Categorical variables converted to factors for machine learning compatibility.\n")
-
-# =============================================================================
-# 10. FEATURE ENGINEERING
-# =============================================================================
-
-cat("\n=== CREATING NEW FEATURES ===\n")
-
-# Create new derived features to improve model performance
-df_clean <- df_clean %>%
-  mutate(
-    # Create age groups for better pattern recognition
-    age_group = cut(age, 
-                    breaks = c(0, 25, 35, 45, 55, 65, 100),
-                    labels = c("18-25", "26-35", "36-45", "46-55", "56-65", "65+"),
-                    include.lowest = TRUE),
-    
-    # Categorize working hours
-    work_intensity = cut(hours_per_week,
-                         breaks = c(0, 20, 40, 60, 100),
-                         labels = c("Part-time", "Full-time", "Overtime", "Excessive"),
-                         include.lowest = TRUE),
-    
-    # Group education levels into meaningful categories
-    education_level = case_when(
-      education %in% c("Preschool", "1st-4th", "5th-6th", "7th-8th") ~ "Elementary",
-      education %in% c("9th", "10th", "11th", "12th", "HS-grad") ~ "High School",
-      education %in% c("Some-college", "Assoc-acdm", "Assoc-voc") ~ "Some College",
-      education %in% c("Bachelors", "Prof-school") ~ "Bachelor",
-      education %in% c("Masters", "Doctorate") ~ "Advanced",
-      TRUE ~ "Other"
+    income_level = dplyr::case_when(
+      income == "<=50K" ~ 0,
+      income == ">50K" ~ 1,
+      TRUE ~ NA_real_
     ),
-    
-    # Create binary indicator for capital activity
-    has_capital_change = ifelse(capital_gain > 0 | capital_loss > 0, 1, 0),
-    
-    # Create net wealth indicator
-    wealth_indicator = capital_gain - capital_loss
-  )
+    income_level = factor(
+      income_level,
+      levels = c(0, 1),
+      labels = c("low_income", "high_income")
+    )
+  ) %>%
+  select(-income)
 
-cat("New features created: age groups, work intensity, education levels, capital indicators.\n")
+TARGET_COL <- "income_level"
 
-# =============================================================================
-# 11. REDUCE CATEGORICAL VARIABLE CARDINALITY
-# =============================================================================
+# Drop any rows with missing target (should be none, but safe)
+raw <- raw %>% filter(!is.na(.data[[TARGET_COL]]))
 
-cat("\n=== REDUCING CATEGORICAL CARDINALITY ===\n")
+# Drop fnlwgt (commonly excluded)
+if ("fnlwgt" %in% names(raw)) {
+  raw <- raw %>% select(-fnlwgt)
+}
 
-# Count frequency of each country
-country_counts <- df_clean %>%
-  count(native_country, sort = TRUE)
+# -----------------------------
+# 3) Split + CV (leakage-safe)
+# -----------------------------
+split_obj <- initial_split(raw, prop = 1 - TEST_PROP, strata = all_of(TARGET_COL))
+train_data <- training(split_obj)
+test_data <- testing(split_obj)
 
-# Identify countries with sufficient representation (more than 100 occurrences)
-top_countries <- country_counts %>%
-  filter(n > 100) %>%
-  pull(native_country)
+# Persist split datasets for reproducibility / later reuse
+readr::write_csv(train_data, file.path(OUTPUT_DIR, "data", "train_data.csv"))
+readr::write_csv(test_data, file.path(OUTPUT_DIR, "data", "test_data.csv"))
 
-# Group rare countries as "Other" to reduce dimensionality
-df_clean <- df_clean %>%
+folds <- vfold_cv(train_data, v = V_FOLDS, strata = all_of(TARGET_COL))
+
+cat("\nTrain rows:", nrow(train_data), " | Test rows:", nrow(test_data), "\n")
+cat("CV folds:", V_FOLDS, "\n")
+
+# ============================================================
+# 4) EDA helpers (optional, TRAIN ONLY)
+# ============================================================
+
+# 4.1) Missingness summary
+missing_summary <- train_data %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "na_count") %>%
   mutate(
-    native_country_simplified = ifelse(as.character(native_country) %in% top_countries,
-                                       as.character(native_country),
-                                       "Other"),
-    native_country_simplified = as.factor(native_country_simplified)
+    n = nrow(train_data),
+    na_pct = round(100 * na_count / n, 2)
+  ) %>%
+  arrange(desc(na_count))
+
+cat("\n=== Missingness (TRAIN) ===\n")
+print(missing_summary %>% filter(na_count > 0))
+
+# 4.2) Is "unknown"/missing informative?
+# (Missing here = NA, which will become "unknown" in the recipe)
+missing_by_target <- function(df, col, target) {
+  df %>%
+    mutate(is_missing = is.na(.data[[col]])) %>%
+    count(.data[[target]], is_missing, name = "n") %>%
+    group_by(.data[[target]]) %>%
+    mutate(pct_within_class = round(100 * n / sum(n), 2)) %>%
+    ungroup()
+}
+
+chisq_missing <- function(df, col, target) {
+  tab <- table(df[[target]], is.na(df[[col]]))
+  # If any expected counts are too small, chi-square may warn;
+  # fisher.test is safer but slower.
+  test <- suppressWarnings(chisq.test(tab))
+  list(tab = tab, test = test)
+}
+
+cramers_v <- function(tab) {
+  # tab is a contingency table
+  chi2 <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
+  n <- sum(tab)
+  k <- min(nrow(tab), ncol(tab))
+  as.numeric(sqrt(chi2 / (n * (k - 1))))
+}
+
+cols_to_check <- c("workclass", "occupation", "native_country")
+
+for (col in cols_to_check) {
+  cat("\n====================================================\n")
+  cat("Column:", col, "\n")
+  cat("====================================================\n")
+
+  print(missing_by_target(train_data, col, TARGET_COL))
+
+  res <- chisq_missing(train_data, col, TARGET_COL)
+  cat("\nContingency table (rows=target, cols=missing?):\n")
+  print(res$tab)
+
+  cat("\nChi-square test:\n")
+  print(res$test)
+
+  cat("\nCramer's V (effect size):\n")
+  print(round(cramers_v(res$tab), 4))
+}
+
+# 4.3) Outlier check
+num_cols <- train_data %>%
+  select(where(is.numeric)) %>%
+  names()
+
+cat("Numeric columns:\n")
+print(num_cols)
+
+outlier_summary <- purrr::map_dfr(num_cols, function(col) {
+  x <- train_data[[col]]
+  x <- x[!is.na(x)]
+
+  if (length(x) == 0) {
+    return(tibble(
+      column = col, n = 0, missing = sum(is.na(train_data[[col]])),
+      q1 = NA_real_, q3 = NA_real_, iqr = NA_real_,
+      lower = NA_real_, upper = NA_real_,
+      outlier_n = NA_integer_, outlier_pct = NA_real_,
+      p01 = NA_real_, p05 = NA_real_, p95 = NA_real_, p99 = NA_real_,
+      min = NA_real_, max = NA_real_
+    ))
+  }
+
+  q1 <- quantile(x, 0.25, na.rm = TRUE, type = 7)
+  q3 <- quantile(x, 0.75, na.rm = TRUE, type = 7)
+  iqr <- q3 - q1
+  lower <- q1 - 1.5 * iqr
+  upper <- q3 + 1.5 * iqr
+
+  outlier_n <- sum(x < lower | x > upper)
+  outlier_pct <- round(100 * outlier_n / length(x), 3)
+
+  tibble(
+    column = col,
+    n = length(x),
+    missing = sum(is.na(train_data[[col]])),
+    q1 = as.numeric(q1), q3 = as.numeric(q3), iqr = as.numeric(iqr),
+    lower = as.numeric(lower), upper = as.numeric(upper),
+    outlier_n = outlier_n, outlier_pct = outlier_pct,
+    p01 = as.numeric(quantile(x, 0.01, na.rm = TRUE)),
+    p05 = as.numeric(quantile(x, 0.05, na.rm = TRUE)),
+    p95 = as.numeric(quantile(x, 0.95, na.rm = TRUE)),
+    p99 = as.numeric(quantile(x, 0.99, na.rm = TRUE)),
+    min = min(x, na.rm = TRUE),
+    max = max(x, na.rm = TRUE)
+  )
+}) %>%
+  arrange(desc(outlier_pct), desc(outlier_n))
+
+print(outlier_summary)
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+num_cols <- train_data %>%
+  select(where(is.numeric)) %>%
+  names()
+
+train_long <- train_data %>%
+  select(all_of(num_cols)) %>%
+  pivot_longer(cols = everything(), names_to = "feature", values_to = "value")
+
+ggplot(train_long, aes(x = feature, y = value)) +
+  geom_boxplot(na.rm = TRUE) +
+  coord_flip() +
+  labs(title = "Boxplots of Numeric Features (Train Only)", x = NULL, y = NULL)
+
+# 4.4) Categorical EDA (TRAIN ONLY) — unique values + histograms
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(stringr)
+})
+
+# 1) Identify categorical columns (character or factor), excluding the target
+cat_cols <- train_data %>%
+  select(where(~ is.character(.x) || is.factor(.x))) %>%
+  select(-all_of(TARGET_COL)) %>%
+  names()
+
+cat("Categorical columns (excluding target):\n")
+print(cat_cols)
+
+# 2) Summary table: #levels, missing count/%, top level + its %
+cat_summary <- purrr::map_dfr(cat_cols, function(col) {
+  x <- train_data[[col]]
+
+  # Treat NA explicitly
+  na_count <- sum(is.na(x))
+  n <- length(x)
+
+  # Unique levels (excluding NA) - count
+  n_levels <- dplyr::n_distinct(x, na.rm = TRUE)
+
+  # Top frequency (excluding NA)
+  tab <- table(x, useNA = "no")
+  if (length(tab) == 0) {
+    top_level <- NA_character_
+    top_n <- 0
+    top_pct <- NA_real_
+  } else {
+    top_level <- names(which.max(tab))
+    top_n <- as.integer(max(tab))
+    top_pct <- round(100 * top_n / sum(tab), 2)
+  }
+
+  tibble(
+    column = col,
+    n_levels = n_levels,
+    na_count = na_count,
+    na_pct = round(100 * na_count / n, 2),
+    top_level = top_level,
+    top_n = top_n,
+    top_pct = top_pct
+  )
+}) %>% arrange(desc(n_levels), desc(na_pct))
+
+cat("\n=== Categorical summary (TRAIN) ===\n")
+print(cat_summary)
+
+# 3) Print full frequency tables for each categorical column (optionally truncated)
+#    Set TOP_K to limit printing if some columns have many levels (like native_country).
+TOP_K <- 20
+
+print_freq <- function(col, top_k = 20) {
+  cat("\n----------------------------------\n")
+  cat("Column:", col, "\n")
+  cat("----------------------------------\n")
+
+  x <- train_data[[col]]
+  tab <- sort(table(x, useNA = "ifany"), decreasing = TRUE)
+  total_non_na <- sum(tab[names(tab) != "<NA>"])
+
+  # Print top_k counts
+  print(head(tab, top_k))
+
+  # If more levels exist, show how many are hidden
+  if (length(tab) > top_k) {
+    cat("... (", length(tab) - top_k, "more levels not shown)\n", sep = "")
+  }
+
+  # Print rare-level stats (excluding NA)
+  if (!is.na(total_non_na) && total_non_na > 0) {
+    rare_1pct <- sum(tab[names(tab) != "<NA>"] < 0.01 * total_non_na)
+    rare_0_5pct <- sum(tab[names(tab) != "<NA>"] < 0.005 * total_non_na)
+    cat("Rare levels (<1% of non-NA):", rare_1pct, "\n")
+    cat("Very rare levels (<0.5% of non-NA):", rare_0_5pct, "\n")
+  }
+}
+
+# Print tables
+invisible(purrr::walk(cat_cols, ~ print_freq(.x, TOP_K)))
+
+# 4) Histograms (bar charts) for each categorical column
+#    NOTE: for high-cardinality columns, we plot top TOP_K + lump others into "OTHER"
+plot_cat <- function(col, top_k = 20) {
+  dfp <- train_data %>%
+    mutate(val = as.character(.data[[col]])) %>%
+    mutate(val = ifelse(is.na(val), "<NA>", val)) %>%
+    count(val, name = "n") %>%
+    arrange(desc(n))
+
+  if (nrow(dfp) > top_k) {
+    dfp <- dfp %>%
+      mutate(val = ifelse(row_number() <= top_k, val, "OTHER")) %>%
+      group_by(val) %>%
+      summarise(n = sum(n), .groups = "drop") %>%
+      arrange(desc(n))
+  }
+
+  ggplot(dfp, aes(x = reorder(val, n), y = n)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste("Categorical histogram:", col),
+      x = col,
+      y = "Count"
+    )
+}
+
+# Plot all categorical columns (one plot per column)
+# If you have many columns, you can run a subset: e.g., cat_cols[1:5]
+for (col in cat_cols) {
+  print(plot_cat(col, TOP_K))
+}
+
+# ============================================================
+# 5) Feature engineering decisions encoded INSIDE recipes
+#    (so they happen fold-safely during CV)
+# ============================================================
+
+# Education grouping (report-friendly and stable)
+# We'll keep:
+# - education_num (numeric)
+# - education_group (categorical derived from education)
+# Then we drop the original detailed education to avoid redundancy.
+education_group_map <- function(education) {
+  case_when(
+    education %in% c("Preschool", "1st-4th", "5th-6th", "7th-8th", "9th", "10th", "11th", "12th") ~ "School",
+    education %in% c("HS-grad") ~ "HighSchool",
+    education %in% c("Some-college", "Assoc-acdm", "Assoc-voc") ~ "SomeCollege_Assoc",
+    education %in% c("Bachelors") ~ "Bachelors",
+    education %in% c("Masters", "Prof-school", "Doctorate") ~ "Graduate",
+    TRUE ~ "Other"
+  )
+}
+
+# ============================================================
+# 6) Recipes
+# ============================================================
+
+# Common preprocessing steps shared across all models:
+# - Convert strings to factors
+# - Missing nominal -> "unknown" (informative for workclass/occupation)
+# - Simplify native_country to US/non_US/unknown (reduce sparsity)
+# - Create hours_category, capital_state, log magnitudes, education_group
+# - Collapse rare factor levels -> "other" (fold-trained)
+# - One-hot encode categoricals
+# - Remove zero-variance columns
+#
+# NOTE: step_normalize is placed BEFORE step_dummy so only numeric predictors are normalized.
+
+base_rec <- recipe(as.formula(paste(TARGET_COL, "~ .")), data = train_data) %>%
+  # Feature engineering (deterministic; safe inside recipe)
+  step_mutate(
+    # native_country simplified: US vs non_US vs unknown
+    native_country_simple = case_when(
+      as.character(native_country) == "United-States" ~ "US",
+      as.character(native_country) == "unknown" ~ "unknown",
+      TRUE ~ "non_US"
+    ),
+
+    # Hours categories (keep numeric hours_per_week too)
+    hours_category = case_when(
+      hours_per_week < 35 ~ "part_time",
+      hours_per_week <= 45 ~ "full_time",
+      hours_per_week <= 60 ~ "overtime",
+      TRUE ~ "extreme_overtime"
+    ),
+
+    # Capital state + log magnitudes
+    capital_state = case_when(
+      capital_gain > 0 ~ "gain",
+      capital_loss > 0 ~ "loss",
+      TRUE ~ "none"
+    ),
+    log_capital_gain = log1p(capital_gain),
+    log_capital_loss = log1p(capital_loss),
+
+    # Education grouping
+    education_group = education_group_map(as.character(education))
+  ) %>%
+  # Ensure character predictors are treated as categorical
+  step_string2factor(all_nominal_predictors()) %>%
+  # Missing categoricals -> "unknown" (fold-safe; no stats learned)
+  step_unknown(all_nominal_predictors(), new_level = "unknown") %>%
+  # Drop raw columns after derived versions to reduce redundancy/skew
+  step_rm(native_country, capital_gain, capital_loss, education) %>%
+  # Rare levels -> "other" (learned per fold from training portion only)
+  step_other(all_nominal_predictors(), threshold = 0.01, other = "other") %>%
+  # Numeric imputation (Adult numeric usually has none, but safe & complete)
+  step_impute_median(all_numeric_predictors()) %>%
+  # Remove zero variance
+  step_zv(all_predictors()) %>%
+  # One-hot encode
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# ---- Logistic Regression recipe (z-score numeric only) ----
+rec_lr <- base_rec %>%
+  # Normalize numeric predictors only (before dummy => dummies unaffected)
+  step_normalize(all_numeric_predictors())
+
+# ---- Naive Bayes recipe ----
+# NB sometimes benefits from scaling numeric predictors; we apply z-score to numeric only.
+# (Dummies are NOT normalized because normalization happens before dummy encoding.)
+rec_nb <- base_rec %>%
+  step_normalize(all_numeric_predictors())
+
+# ---- Random Forest recipe ----
+# Trees do not need normalization.
+rec_rf <- base_rec
+
+# ============================================================
+# 7) Save a bundle for the modeling/tuning script
+# ============================================================
+
+preprocess_bundle <- list(
+  meta = list(
+    data_path = DATA_PATH,
+    target_col = TARGET_COL,
+    test_prop = TEST_PROP,
+    v_folds = V_FOLDS,
+    positive_class = "high_income"
+  ),
+  split_obj = split_obj,
+  train_data = train_data,
+  test_data = test_data,
+  folds = folds,
+  recipes = list(
+    logistic = rec_lr,
+    naive_bayes = rec_nb,
+    random_forest = rec_rf
+  )
+)
+
+saveRDS(preprocess_bundle, file.path(OUTPUT_DIR, "preprocess_bundle.rds"))
+cat("\nSaved bundle:", file.path(OUTPUT_DIR, "preprocess_bundle.rds"), "\n")
+
+# ============================================================
+# 8) Modeling + Tuning
+# Models: Logistic Regression (glmnet), Naive Bayes, Random Forest (ranger)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tidymodels)
+  library(readr)
+  library(discrim)
+  library(klaR)
+})
+
+set.seed(404)
+
+# -----------------------------
+# 0) Load bundle
+# -----------------------------
+BUNDLE_PATH <- "outputs/preprocess_bundle.rds"
+bundle <- readRDS(BUNDLE_PATH)
+
+train_data <- bundle$train_data
+test_data <- bundle$test_data
+folds <- bundle$folds
+TARGET_COL <- bundle$meta$target_col
+
+rec_lr <- bundle$recipes$logistic
+rec_nb <- bundle$recipes$naive_bayes
+rec_rf <- bundle$recipes$random_forest
+
+OUTPUT_DIR <- "outputs"
+dir.create(file.path(OUTPUT_DIR, "models"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "reports"), showWarnings = FALSE, recursive = TRUE)
+
+# yardstick: event = second level (high_income)
+options(yardstick.event_first = FALSE)
+
+# -----------------------------
+# 1) Metrics (imbalance-aware)
+# -----------------------------
+metrics <- metric_set(roc_auc, pr_auc, accuracy, bal_accuracy, f_meas, precision, recall)
+
+ctrl <- control_grid(
+  save_pred = TRUE,
+  save_workflow = TRUE,
+  verbose = TRUE
+)
+
+# -----------------------------
+# 2) Model specs + grids
+# -----------------------------
+# Logistic Regression (glmnet)
+lr_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+lr_grid <- grid_regular(
+  penalty(range = c(-4, 0)), # 1e-4 to 10 (log10 scale)
+  mixture(range = c(0, 1)),
+  levels = c(penalty = 10, mixture = 5)
+)
+
+# Naive Bayes (engine may vary; klaR works in many setups)
+nb_spec <- naive_Bayes(smoothness = tune(), Laplace = tune()) %>%
+  set_engine("klaR") %>%
+  set_mode("classification")
+
+nb_grid <- crossing(
+  smoothness = c(0.5, 1, 2),
+  Laplace    = c(0, 0.5, 1, 2)
+)
+
+# Random Forest (ranger)
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 500) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_grid <- grid_space_filling(
+  mtry(range = c(2L, 30L)),
+  min_n(range = c(2L, 40L)),
+  size = 25
+)
+
+# -----------------------------
+# 3) Workflows
+# -----------------------------
+wf_lr <- workflow() %>%
+  add_recipe(rec_lr) %>%
+  add_model(lr_spec)
+wf_nb <- workflow() %>%
+  add_recipe(rec_nb) %>%
+  add_model(nb_spec)
+wf_rf <- workflow() %>%
+  add_recipe(rec_rf) %>%
+  add_model(rf_spec)
+
+# -----------------------------
+# 4) Tuning (CV)
+# -----------------------------
+cat("\n============================\nTuning: Logistic Regression\n============================\n")
+res_lr <- tune_grid(
+  wf_lr,
+  resamples = folds,
+  grid = lr_grid,
+  metrics = metrics,
+  control = ctrl
+)
+
+cat("\n============================\nTuning: Naive Bayes\n============================\n")
+res_nb <- tune_grid(
+  wf_nb,
+  resamples = folds,
+  grid = nb_grid,
+  metrics = metrics,
+  control = ctrl
+)
+
+cat("\n============================\nTuning: Random Forest\n============================\n")
+res_rf <- tune_grid(
+  wf_rf,
+  resamples = folds,
+  grid = rf_grid,
+  metrics = metrics,
+  control = ctrl
+)
+
+# Save tuning results
+saveRDS(res_lr, file.path(OUTPUT_DIR, "models", "tune_lr.rds"))
+saveRDS(res_nb, file.path(OUTPUT_DIR, "models", "tune_nb.rds"))
+saveRDS(res_rf, file.path(OUTPUT_DIR, "models", "tune_rf.rds"))
+
+# -----------------------------
+# 5) Pick best by PR AUC (primary)
+# -----------------------------
+best_lr <- select_best(res_lr, metric = "pr_auc")
+best_nb <- select_best(res_nb, metric = "pr_auc")
+best_rf <- select_best(res_rf, metric = "pr_auc")
+
+cat("\nBest LR params (PR AUC):\n")
+print(best_lr)
+cat("\nBest NB params (PR AUC):\n")
+print(best_nb)
+cat("\nBest RF params (PR AUC):\n")
+print(best_rf)
+
+# Finalize workflows
+final_wf_lr <- finalize_workflow(wf_lr, best_lr)
+final_wf_nb <- finalize_workflow(wf_nb, best_nb)
+final_wf_rf <- finalize_workflow(wf_rf, best_rf)
+
+# Fit finalists on full TRAIN (still no test usage for decisions)
+fit_lr <- fit(final_wf_lr, data = train_data)
+fit_nb <- fit(final_wf_nb, data = train_data)
+fit_rf <- fit(final_wf_rf, data = train_data)
+
+saveRDS(fit_lr, file.path(OUTPUT_DIR, "models", "final_lr_fit.rds"))
+saveRDS(fit_nb, file.path(OUTPUT_DIR, "models", "final_nb_fit.rds"))
+saveRDS(fit_rf, file.path(OUTPUT_DIR, "models", "final_rf_fit.rds"))
+
+# -----------------------------
+# 6) Quick CV report tables (top configs)
+# -----------------------------
+top_k <- function(res, metric = "pr_auc", k = 10) {
+  collect_metrics(res) %>%
+    filter(.metric == metric) %>%
+    arrange(desc(mean)) %>%
+    slice_head(n = k)
+}
+
+write_csv(top_k(res_lr), file.path(OUTPUT_DIR, "reports", "top10_lr_pr_auc.csv"))
+write_csv(top_k(res_nb), file.path(OUTPUT_DIR, "reports", "top10_nb_pr_auc.csv"))
+write_csv(top_k(res_rf), file.path(OUTPUT_DIR, "reports", "top10_rf_pr_auc.csv"))
+
+cat("\nDone.\n")
+cat("Saved tuning results to outputs/models/ and top-10 tables to outputs/reports/.\n")
+cat("Next step: choose thresholds using CV preds, then evaluate once on test.\n")
+
+# ============================================================
+# 09) Threshold Selection + Ensemble (Leakage-safe)
+# Uses out-of-fold CV predictions from tune_*.rds
+# Objective: choose threshold that maximizes F1 on CV predictions
+# Then save thresholds + curves for reporting.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tidymodels)
+})
+
+set.seed(404)
+options(yardstick.event_first = FALSE)
+
+# -----------------------------
+# 0) Load saved tuning results
+# -----------------------------
+res_lr <- readRDS(file.path(OUTPUT_DIR, "models", "tune_lr.rds"))
+res_nb <- readRDS(file.path(OUTPUT_DIR, "models", "tune_nb.rds"))
+res_rf <- readRDS(file.path(OUTPUT_DIR, "models", "tune_rf.rds"))
+
+# Pick best config by PR AUC (same rule you used for finalists)
+best_lr <- select_best(res_lr, metric = "pr_auc")
+best_nb <- select_best(res_nb, metric = "pr_auc")
+best_rf <- select_best(res_rf, metric = "pr_auc")
+
+# -----------------------------
+# 1) Helpers
+# -----------------------------
+make_class <- function(p, threshold) {
+  factor(
+    ifelse(p >= threshold, "high_income", "low_income"),
+    levels = c("low_income", "high_income")
+  )
+}
+
+# Metrics we care about during threshold selection
+thresh_metrics <- metric_set(f_meas, precision, recall, bal_accuracy, accuracy)
+
+threshold_curve <- function(df, prob_col = ".pred_high_income",
+                            truth_col = "income_level",
+                            thresholds = seq(0.01, 0.99, by = 0.01)) {
+  map_dfr(thresholds, function(t) {
+    tmp <- df %>%
+      dplyr::mutate(.pred_class = make_class(.data[[prob_col]], t))
+
+    m <- thresh_metrics(
+      tmp,
+      truth = !!sym(truth_col),
+      estimate = .pred_class
+    )
+
+    m %>%
+      dplyr::mutate(threshold = t) %>%
+      dplyr::select(threshold, .metric, .estimator, .estimate)
+  }) %>%
+    pivot_wider(names_from = .metric, values_from = .estimate)
+}
+
+pick_best_threshold_f1 <- function(curve_df) {
+  # Primary: max F1
+  # Tie-breaker: higher recall, then higher balanced accuracy
+  curve_df %>%
+    arrange(desc(f_meas), desc(recall), desc(bal_accuracy)) %>%
+    slice(1)
+}
+
+# Extract out-of-fold predictions for the best config.
+# We rely on `.row` + `id` to align across models.
+oof_best_preds <- function(res, best_params, model_name) {
+  collect_predictions(res) %>%
+    semi_join(best_params, by = names(best_params)) %>%
+    dplyr::select(id, .row, income_level, .pred_high_income) %>%
+    dplyr::rename(!!paste0("p_", model_name) := .pred_high_income)
+}
+
+# -----------------------------
+# 2) Threshold selection per model (OOF CV)
+# -----------------------------
+oof_lr <- oof_best_preds(res_lr, best_lr, "lr")
+oof_nb <- oof_best_preds(res_nb, best_nb, "nb")
+oof_rf <- oof_best_preds(res_rf, best_rf, "rf")
+
+curve_lr <- threshold_curve(oof_lr %>% dplyr::rename(.pred_high_income = p_lr))
+curve_nb <- threshold_curve(oof_nb %>% dplyr::rename(.pred_high_income = p_nb))
+curve_rf <- threshold_curve(oof_rf %>% dplyr::rename(.pred_high_income = p_rf))
+
+bestT_lr <- pick_best_threshold_f1(curve_lr) %>% dplyr::mutate(model = "LogReg")
+bestT_nb <- pick_best_threshold_f1(curve_nb) %>% dplyr::mutate(model = "NaiveBayes")
+bestT_rf <- pick_best_threshold_f1(curve_rf) %>% dplyr::mutate(model = "RandomForest")
+
+best_thresholds_single <- bind_rows(bestT_lr, bestT_nb, bestT_rf) %>%
+  dplyr::select(model, threshold, f_meas, precision, recall, bal_accuracy, accuracy)
+
+print(best_thresholds_single)
+
+write_csv(curve_lr, file.path(OUTPUT_DIR, "reports", "threshold_curve_lr.csv"))
+write_csv(curve_nb, file.path(OUTPUT_DIR, "reports", "threshold_curve_nb.csv"))
+write_csv(curve_rf, file.path(OUTPUT_DIR, "reports", "threshold_curve_rf.csv"))
+write_csv(best_thresholds_single, file.path(OUTPUT_DIR, "reports", "best_thresholds_single_models.csv"))
+
+# -----------------------------
+# 3) Ensemble options (soft voting)
+#    Ensemble is built from OOF predictions (still leakage-safe).
+# -----------------------------
+
+# Align OOF predictions by id + row
+oof_ens <- oof_lr %>%
+  inner_join(oof_rf, by = c("id", ".row", "income_level")) %>%
+  inner_join(oof_nb, by = c("id", ".row", "income_level")) %>%
+  dplyr::mutate(
+    p_avg = (p_lr + p_rf + p_nb) / 3,
+    # Optional weighted average (edit weights if you want)
+    p_wavg = (0.33 * p_lr + 0.34 * p_rf + 0.33 * p_nb)
   )
 
-cat("Reduced native_country categories from", length(levels(df_clean$native_country)),
-    "to", length(unique(df_clean$native_country_simplified)), "categories.\n")
+curve_avg <- threshold_curve(oof_ens %>% dplyr::rename(.pred_high_income = p_avg))
+curve_wavg <- threshold_curve(oof_ens %>% dplyr::rename(.pred_high_income = p_wavg))
 
-# =============================================================================
-# 12. FEATURE SCALING/NORMALIZATION
-# =============================================================================
+bestT_avg <- pick_best_threshold_f1(curve_avg) %>% dplyr::mutate(model = "Ensemble_Avg")
+bestT_wavg <- pick_best_threshold_f1(curve_wavg) %>% dplyr::mutate(model = "Ensemble_Weighted")
 
-cat("\n=== SCALING NUMERICAL FEATURES ===\n")
+best_thresholds_ens <- bind_rows(bestT_avg, bestT_wavg) %>%
+  dplyr::select(model, threshold, f_meas, precision, recall, bal_accuracy, accuracy)
 
-# Standardize numerical features (mean=0, sd=1) for algorithms sensitive to scale
-cat("Numerical variables being scaled:\n")
-print(numerical_vars)
+print(best_thresholds_ens)
 
-preprocess_params <- preProcess(df_clean %>% select(all_of(numerical_vars)),
-                                method = c("center", "scale"))
+write_csv(curve_avg, file.path(OUTPUT_DIR, "reports", "threshold_curve_ensemble_avg.csv"))
+write_csv(curve_wavg, file.path(OUTPUT_DIR, "reports", "threshold_curve_ensemble_wavg.csv"))
+write_csv(best_thresholds_ens, file.path(OUTPUT_DIR, "reports", "best_thresholds_ensembles.csv"))
 
-# Apply scaling to create normalized dataset
-df_normalized <- predict(preprocess_params, df_clean)
-
-cat("Numerical features standardized (mean=0, sd=1).\n")
-
-# =============================================================================
-# 13. DATA SPLITTING FOR MACHINE LEARNING
-# =============================================================================
-
-cat("\n=== SPLITTING DATA FOR MACHINE LEARNING ===\n")
-
-# Set random seed for reproducibility
-set.seed(123)
-
-# Initial split: 70% training, 30% testing (stratified by income to preserve distribution)
-train_index <- createDataPartition(df_normalized$income, 
-                                   p = 0.7, 
-                                   list = FALSE)
-train_data <- df_normalized[train_index, ]
-test_data <- df_normalized[-train_index, ]
-
-# Further split training data: 80% final training, 20% validation
-val_index <- createDataPartition(train_data$income,
-                                 p = 0.2,
-                                 list = FALSE)
-val_data <- train_data[val_index, ]
-train_final <- train_data[-val_index, ]
-
-# =============================================================================
-# 14. FINAL DATASET VERIFICATION
-# =============================================================================
-
-cat("\n=== FINAL DATASET VERIFICATION ===\n")
-
-# Print dataset dimensions
-cat("\nDataset Dimensions:\n")
-cat("Full normalized dataset:", dim(df_normalized), "\n")
-cat("Training set:", dim(train_final), "\n")
-cat("Validation set:", dim(val_data), "\n")
-cat("Test set:", dim(test_data), "\n")
-
-# Verify class distribution is preserved across splits
-cat("\nClass Distribution Across Splits:\n")
-distribution_table <- rbind(
-  "Full" = prop.table(table(df_normalized$income)),
-  "Train" = prop.table(table(train_final$income)),
-  "Validation" = prop.table(table(val_data$income)),
-  "Test" = prop.table(table(test_data$income))
-)
-print(round(distribution_table, 4))
-
-# =============================================================================
-# 15. SAVE PROCESSED DATASETS
-# =============================================================================
-
-cat("\n=== SAVING PROCESSED DATASETS ===\n")
-
-# Save all processed datasets for future use
-write.csv(df_normalized, "adult_income_cleaned.csv", row.names = FALSE)
-write.csv(train_final, "adult_income_train.csv", row.names = FALSE)
-write.csv(val_data, "adult_income_validation.csv", row.names = FALSE)
-write.csv(test_data, "adult_income_test.csv", row.names = FALSE)
-
-cat("✓ adult_income_cleaned.csv - Complete cleaned dataset\n")
-cat("✓ adult_income_train.csv - Training set (56% of data)\n")
-cat("✓ adult_income_validation.csv - Validation set (14% of data)\n")
-cat("✓ adult_income_test.csv - Test set (30% of data)\n")
-
-# =============================================================================
-# 16. CREATE DATA DICTIONARY FOR DOCUMENTATION
-# =============================================================================
-
-cat("\n=== CREATING DATA DICTIONARY ===\n")
-
-# Generate comprehensive documentation of all variables
-data_dictionary <- data.frame(
-  Variable = names(df_normalized),
-  Type = sapply(df_normalized, class),
-  Description = c(
-    "Age of individual",
-    "Type of employment",
-    "Final weight (sampling weight for population representation)",
-    "Highest education level",
-    "Education numerical encoding (higher = more education)",
-    "Marital status",
-    "Occupation category",
-    "Relationship status in household",
-    "Race",
-    "Sex",
-    "Capital gains (investment profits)",
-    "Capital losses (investment losses)",
-    "Hours worked per week",
-    "Country of origin",
-    "Target variable: Income level (<=50K or >50K)",
-    "Log-transformed capital gain (reduces skewness)",
-    "Log-transformed capital loss (reduces skewness)",
-    "Age group categorization for pattern analysis",
-    "Work intensity category based on weekly hours",
-    "Education level grouping for simplified analysis",
-    "Binary indicator: 1 if any capital change, 0 otherwise",
-    "Net wealth indicator (gains minus losses)",
-    "Simplified country categorization (frequent countries kept, others grouped)"
-  ),
-  Missing_Values = sapply(df_normalized, function(x) sum(is.na(x))),
-  Unique_Values = sapply(df_normalized, function(x) length(unique(x)))
+# -----------------------------
+# 4) Save a compact object for later final test evaluation
+# -----------------------------
+threshold_bundle <- list(
+  best_params = list(lr = best_lr, nb = best_nb, rf = best_rf),
+  best_thresholds_single = best_thresholds_single,
+  best_thresholds_ens = best_thresholds_ens
 )
 
-# Save data dictionary
-write.csv(data_dictionary, "data_dictionary.csv", row.names = FALSE)
-cat("✓ data_dictionary.csv - Complete variable documentation\n")
+saveRDS(threshold_bundle, file.path(OUTPUT_DIR, "models", "threshold_bundle.rds"))
+cat("\nSaved:", file.path(OUTPUT_DIR, "models", "threshold_bundle.rds"), "\n")
+cat("Next step: final evaluation on test using the chosen thresholds (no re-selection).\n")
 
-# =============================================================================
-# 17. FINAL STATUS AND NEXT STEPS
-# =============================================================================
+# ============================================================
+# Final TEST Evaluation (Conflict-safe + Version-robust)
+# - Uses frozen thresholds from threshold_bundle.rds if present
+# - Evaluates single models + ensembles on TEST
+# - Writes metrics + confusion matrices to CSV
+# ============================================================
 
-# Alternative using paste()
-cat(paste0(
-  "\n", strrep("=", 60), "\n",
-  "✅ DATA PREPROCESSING COMPLETED SUCCESSFULLY!\n",
-  strrep("=", 60), "\n\n",
-  
-  "📊 SUMMARY OF PROCESSING STEPS:\n",
-  "1. Loaded raw data (32,561 rows × 15 columns)\n",
-  "2. Cleaned column names (dots → underscores)\n",
-  "3. Converted '?' to NA for proper missing value handling\n",
-  "4. Imputed missing values (workclass: 5.6%, occupation: 5.7%)\n",
-  "5. Detected and capped outliers in age and hours\n",
-  "6. Applied log transformation to skewed capital variables\n",
-  "7. Encoded categorical variables as factors\n",
-  "8. Created 6 new engineered features\n",
-  "9. Reduced native_country from 42 to manageable categories\n",
-  "10. Standardized numerical features (mean=0, sd=1)\n",
-  "11. Split data into Train (56%), Validation (14%), Test (30%)\n",
-  "12. Saved 4 processed datasets and data dictionary\n\n",
-  
-  "🎯 NEXT STEPS FOR YOUR PROJECT:\n",
-  "1. Perform Exploratory Data Analysis (EDA)\n",
-  "2. Formulate and test hypotheses\n",
-  "3. Build machine learning models (Logistic Regression, Random Forest, etc.)\n",
-  "4. Evaluate model performance using validation and test sets\n",
-  "5. Create project documentation and poster\n\n",
-  
-  "📁 FILES CREATED:\n",
-  "• adult_income_cleaned.csv - Complete processed dataset\n",
-  "• adult_income_train.csv - Training data for model development\n",
-  "• adult_income_validation.csv - Validation data for tuning\n",
-  "• adult_income_test.csv - Test data for final evaluation\n",
-  "• data_dictionary.csv - Complete variable documentation\n\n",
-  
-  strrep("=", 60), "\n"
-))
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tidymodels)
+  library(readr)
+})
 
+set.seed(404)
+options(yardstick.event_first = FALSE) # positive class = "high_income"
+
+# -----------------------------
+# 0) Load TEST data + final fits
+# -----------------------------
+test_data <- readr::read_csv(
+  file.path(OUTPUT_DIR, "data", "test_data.csv"),
+  show_col_types = FALSE
+)
+
+fit_lr <- readRDS(file.path(OUTPUT_DIR, "models", "final_lr_fit.rds"))
+fit_nb <- readRDS(file.path(OUTPUT_DIR, "models", "final_nb_fit.rds"))
+fit_rf <- readRDS(file.path(OUTPUT_DIR, "models", "final_rf_fit.rds"))
+
+# -----------------------------
+# 1) Load frozen thresholds (recommended)
+# -----------------------------
+THRESH_BUNDLE_PATH <- file.path(OUTPUT_DIR, "models", "threshold_bundle.rds")
+
+if (file.exists(THRESH_BUNDLE_PATH)) {
+  th <- readRDS(THRESH_BUNDLE_PATH)
+
+  # Expecting tables with columns: model, threshold
+  t_single <- th$best_thresholds_single
+  t_ens <- th$best_thresholds_ens
+
+  getT <- function(tbl, name, fallback) {
+    v <- tbl %>%
+      dplyr::filter(model == name) %>%
+      dplyr::pull(threshold)
+
+    if (length(v) == 0) fallback else v[[1]]
+  }
+
+  T_LR <- getT(t_single, "LogReg", 0.59)
+  T_NB <- getT(t_single, "NaiveBayes", 0.40)
+  T_RF <- getT(t_single, "RandomForest", 0.55)
+  T_EA <- getT(t_ens, "Ensemble_Avg", 0.48)
+  T_EW <- getT(t_ens, "Ensemble_Weighted", 0.48)
+} else {
+  # Fallback thresholds
+  T_LR <- 0.59
+  T_NB <- 0.40
+  T_RF <- 0.55
+  T_EA <- 0.48
+  T_EW <- 0.48
+}
+
+# -----------------------------
+# 2) Helpers (conflict-safe + robust)
+# -----------------------------
+make_class <- function(p, threshold) {
+  factor(
+    ifelse(p >= threshold, "high_income", "low_income"),
+    levels = c("low_income", "high_income")
+  )
+}
+
+# Robust confusion-matrix export (works even if as_tibble(conf_mat) isn't supported)
+conf_mat_df <- function(cm) {
+  out <- base::as.data.frame(cm$table, stringsAsFactors = FALSE)
+  names(out) <- c("truth", "estimate", "n")
+  out
+}
+
+# Vector-based evaluation avoids metric_set() / tidyselect column-selection pitfalls
+eval_from_probs <- function(df, model_name, prob_col, threshold) {
+  # Guard common paste typo: ".pred_high_income," or "p_avg,"
+  prob_col <- sub(",\\s*$", "", prob_col)
+
+  if (!("income_level" %in% names(df))) {
+    stop("Missing required column: income_level", call. = FALSE)
+  }
+  if (!(prob_col %in% names(df))) {
+    stop(sprintf(
+      "Column '%s' not found for model '%s'. Available columns: %s",
+      prob_col, model_name, paste(names(df), collapse = ", ")
+    ), call. = FALSE)
+  }
+
+  df2 <- df %>%
+    dplyr::mutate(
+      income_level = factor(income_level, levels = c("low_income", "high_income")),
+      .pred_high_income = as.numeric(.data[[prob_col]]),
+      .pred_class = make_class(.pred_high_income, threshold)
+    )
+
+  truth <- df2$income_level
+  prob <- df2$.pred_high_income
+  pred <- df2$.pred_class
+
+  metrics_tbl <- tibble::tibble(
+    model = model_name,
+    threshold = threshold,
+    .metric = c("roc_auc", "pr_auc", "f_meas", "precision", "recall", "bal_accuracy", "accuracy"),
+    .estimate = c(
+      yardstick::roc_auc_vec(truth, prob, event_level = "second"),
+      yardstick::pr_auc_vec(truth, prob, event_level = "second"),
+      yardstick::f_meas_vec(truth, pred, event_level = "second"),
+      yardstick::precision_vec(truth, pred, event_level = "second"),
+      yardstick::recall_vec(truth, pred, event_level = "second"),
+      yardstick::bal_accuracy_vec(truth, pred, event_level = "second"),
+      yardstick::accuracy_vec(truth, pred)
+    )
+  )
+
+  cm <- yardstick::conf_mat(df2, truth = income_level, estimate = .pred_class)
+
+  list(metrics = metrics_tbl, conf_mat = cm)
+}
+
+# -----------------------------
+# 3) Predict probabilities on TEST
+# -----------------------------
+pred_lr <- predict(fit_lr, test_data, type = "prob") %>%
+  dplyr::bind_cols(test_data %>% dplyr::select(income_level))
+
+pred_nb <- predict(fit_nb, test_data, type = "prob") %>%
+  dplyr::bind_cols(test_data %>% dplyr::select(income_level))
+
+pred_rf <- predict(fit_rf, test_data, type = "prob") %>%
+  dplyr::bind_cols(test_data %>% dplyr::select(income_level))
+
+stopifnot(".pred_high_income" %in% names(pred_lr))
+stopifnot(".pred_high_income" %in% names(pred_nb))
+stopifnot(".pred_high_income" %in% names(pred_rf))
+
+# -----------------------------
+# 4) Evaluate single models on TEST using frozen thresholds
+# -----------------------------
+res_lr <- eval_from_probs(pred_lr, "LogReg", ".pred_high_income", T_LR)
+res_nb <- eval_from_probs(pred_nb, "NaiveBayes", ".pred_high_income", T_NB)
+res_rf <- eval_from_probs(pred_rf, "RandomForest", ".pred_high_income", T_RF)
+
+# -----------------------------
+# 5) Ensembles on TEST (soft voting)
+# -----------------------------
+ens_df <- test_data %>%
+  dplyr::select(income_level) %>%
+  dplyr::mutate(
+    p_lr = pred_lr$.pred_high_income,
+    p_nb = pred_nb$.pred_high_income,
+    p_rf = pred_rf$.pred_high_income,
+    p_avg = (p_lr + p_nb + p_rf) / 3,
+    # same weights as CV script
+    p_wavg = (0.33 * p_lr + 0.33 * p_nb + 0.34 * p_rf)
+  )
+
+res_ea <- eval_from_probs(ens_df, "Ensemble_Avg", "p_avg", T_EA)
+res_ew <- eval_from_probs(ens_df, "Ensemble_Weighted", "p_wavg", T_EW)
+
+# -----------------------------
+# 6) Save report-friendly outputs
+# -----------------------------
+all_metrics <- dplyr::bind_rows(
+  res_lr$metrics, res_nb$metrics, res_rf$metrics,
+  res_ea$metrics, res_ew$metrics
+) %>%
+  dplyr::arrange(
+    model,
+    match(.metric, c("roc_auc", "pr_auc", "f_meas", "precision", "recall", "bal_accuracy", "accuracy"))
+  )
+
+readr::write_csv(all_metrics, file.path(OUTPUT_DIR, "reports", "final_test_metrics.csv"))
+
+# Confusion matrices as CSV (robust across package versions)
+readr::write_csv(conf_mat_df(res_lr$conf_mat), file.path(OUTPUT_DIR, "reports", "confmat_test_lr.csv"))
+readr::write_csv(conf_mat_df(res_nb$conf_mat), file.path(OUTPUT_DIR, "reports", "confmat_test_nb.csv"))
+readr::write_csv(conf_mat_df(res_rf$conf_mat), file.path(OUTPUT_DIR, "reports", "confmat_test_rf.csv"))
+readr::write_csv(conf_mat_df(res_ea$conf_mat), file.path(OUTPUT_DIR, "reports", "confmat_test_ensemble_avg.csv"))
+readr::write_csv(conf_mat_df(res_ew$conf_mat), file.path(OUTPUT_DIR, "reports", "confmat_test_ensemble_wavg.csv"))
+
+# Print a compact summary to console
+cat("\n================ FINAL TEST METRICS (Key Rows) ================\n")
+print(
+  all_metrics %>%
+    dplyr::filter(.metric %in% c("roc_auc", "pr_auc", "f_meas", "precision", "recall", "bal_accuracy", "accuracy")) %>%
+    tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+    dplyr::arrange(dplyr::desc(pr_auc))
+)
+
+cat("\nSaved:\n")
+cat(" - outputs/reports/final_test_metrics.csv\n")
+cat(" - outputs/reports/confmat_test_*.csv\n")
+cat("Done.\n")
