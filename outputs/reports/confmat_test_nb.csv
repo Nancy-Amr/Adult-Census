@@ -1,0 +1,5 @@
+truth,estimate,n
+low_income,low_income,4739
+high_income,low_income,201
+low_income,high_income,827
+high_income,high_income,741
