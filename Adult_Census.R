@@ -11,9 +11,9 @@ run_lines <- function(from, to, file = "Adult_Census.R") {
   eval(parse(text = code), envir = .GlobalEnv)
 }
 
-# -----------------------------
+# ============================================================
 # 0) Libraries + global options
-# -----------------------------
+# ============================================================
 suppressPackageStartupMessages({
   library(tidyverse)
   library(tidymodels)
@@ -46,9 +46,9 @@ dir.create(file.path(OUTPUT_DIR, "data"), showWarnings = FALSE, recursive = TRUE
 # We'll set income_level levels as: low_income, high_income => high_income is positive.
 options(yardstick.event_first = FALSE)
 
-# ===========
+# ============================================================
 # 1) Load + deterministic cleaning (safe globally)
-# ===========
+# ============================================================
 
 raw <- readr::read_csv(DATA_PATH, show_col_types = FALSE) %>%
   janitor::clean_names()
@@ -89,9 +89,9 @@ cat(
 # 1.2) Remove exact duplicates (keeps 1 copy)
 raw <- raw %>% distinct()
 
-# -----------------------------
+# ============================================================
 # 2) Target inspection + clean mapping
-# -----------------------------
+# ============================================================
 cat("Unique values in target:\n")
 print(sort(unique(raw[[TARGET_COL]]), na.last = TRUE))
 
@@ -129,9 +129,9 @@ if ("fnlwgt" %in% names(raw)) {
   raw <- raw %>% select(-fnlwgt)
 }
 
-# -----------------------------
+# ============================================================
 # 3) Split + CV (leakage-safe)
-# -----------------------------
+# ============================================================
 split_obj <- initial_split(raw, prop = 1 - TEST_PROP, strata = all_of(TARGET_COL))
 train_data <- training(split_obj)
 test_data <- testing(split_obj)
@@ -146,7 +146,14 @@ cat("\nTrain rows:", nrow(train_data), " | Test rows:", nrow(test_data), "\n")
 cat("CV folds:", V_FOLDS, "\n")
 
 # ============================================================================
-# HYPOTHESIS TESTING FOR Income Level Prediction
+# 4) EDA
+# ============================================================================
+
+
+
+
+# ============================================================================
+# 5) HYPOTHESIS TESTING on Features
 # ============================================================================
 
 # 1. LOAD THE DATA
@@ -460,11 +467,11 @@ ggplot(t_vis,
   theme(legend.position = "none")
 
 
-# ============================================================
-# 4) EDA helpers (optional, TRAIN ONLY)
-# ============================================================
+# ============================================================================
+# 6) helpers (optional, TRAIN ONLY)
+# ============================================================================
 
-# 4.1) Missingn summary
+# 6.1) Missingn summary
 missing_summary <- train_data %>%
   summarise(across(everything(), ~ sum(is.na(.x)))) %>%
   pivot_longer(everything(), names_to = "column", values_to = "na_count") %>%
@@ -477,7 +484,7 @@ missing_summary <- train_data %>%
 cat("\n=== Missingness (TRAIN) ===\n")
 print(missing_summary %>% filter(na_count > 0))
 
-# 4.2) Is "unknown"/missing informative?
+# 6.2) Is "unknown"/missing informative?
 # (Missing here = NA, which will become "unknown" in the recipe)
 missing_by_target <- function(df, col, target) {
   df %>%
@@ -510,21 +517,21 @@ for (col in cols_to_check) {
   cat("\n====================================================\n")
   cat("Column:", col, "\n")
   cat("====================================================\n")
-
+  
   print(missing_by_target(train_data, col, TARGET_COL))
-
+  
   res <- chisq_missing(train_data, col, TARGET_COL)
   cat("\nContingency table (rows=target, cols=missing?):\n")
   print(res$tab)
-
+  
   cat("\nChi-square test:\n")
   print(res$test)
-
+  
   cat("\nCramer's V (effect size):\n")
   print(round(cramers_v(res$tab), 4))
 }
 
-# 4.3) Outlier check
+# 6.3) Outlier check
 num_cols <- train_data %>%
   select(where(is.numeric)) %>%
   names()
@@ -535,7 +542,7 @@ print(num_cols)
 outlier_summary <- purrr::map_dfr(num_cols, function(col) {
   x <- train_data[[col]]
   x <- x[!is.na(x)]
-
+  
   if (length(x) == 0) {
     return(tibble(
       column = col, n = 0, missing = sum(is.na(train_data[[col]])),
@@ -546,16 +553,16 @@ outlier_summary <- purrr::map_dfr(num_cols, function(col) {
       min = NA_real_, max = NA_real_
     ))
   }
-
+  
   q1 <- quantile(x, 0.25, na.rm = TRUE, type = 7)
   q3 <- quantile(x, 0.75, na.rm = TRUE, type = 7)
   iqr <- q3 - q1
   lower <- q1 - 1.5 * iqr
   upper <- q3 + 1.5 * iqr
-
+  
   outlier_n <- sum(x < lower | x > upper)
   outlier_pct <- round(100 * outlier_n / length(x), 3)
-
+  
   tibble(
     column = col,
     n = length(x),
@@ -610,14 +617,14 @@ print(cat_cols)
 # 2) Summary table: #levels, missing count/%, top level + its %
 cat_summary <- purrr::map_dfr(cat_cols, function(col) {
   x <- train_data[[col]]
-
+  
   # Treat NA explicitly
   na_count <- sum(is.na(x))
   n <- length(x)
-
+  
   # Unique levels (excluding NA) - count
   n_levels <- dplyr::n_distinct(x, na.rm = TRUE)
-
+  
   # Top frequency (excluding NA)
   tab <- table(x, useNA = "no")
   if (length(tab) == 0) {
@@ -629,7 +636,7 @@ cat_summary <- purrr::map_dfr(cat_cols, function(col) {
     top_n <- as.integer(max(tab))
     top_pct <- round(100 * top_n / sum(tab), 2)
   }
-
+  
   tibble(
     column = col,
     n_levels = n_levels,
@@ -652,19 +659,19 @@ print_freq <- function(col, top_k = 20) {
   cat("\n----------------------------------\n")
   cat("Column:", col, "\n")
   cat("----------------------------------\n")
-
+  
   x <- train_data[[col]]
   tab <- sort(table(x, useNA = "ifany"), decreasing = TRUE)
   total_non_na <- sum(tab[names(tab) != "<NA>"])
-
+  
   # Print top_k counts
   print(head(tab, top_k))
-
+  
   # If more levels exist, show how many are hidden
   if (length(tab) > top_k) {
     cat("... (", length(tab) - top_k, "more levels not shown)\n", sep = "")
   }
-
+  
   # Print rare-level stats (excluding NA)
   if (!is.na(total_non_na) && total_non_na > 0) {
     rare_1pct <- sum(tab[names(tab) != "<NA>"] < 0.01 * total_non_na)
@@ -685,7 +692,7 @@ plot_cat <- function(col, top_k = 20) {
     mutate(val = ifelse(is.na(val), "<NA>", val)) %>%
     count(val, name = "n") %>%
     arrange(desc(n))
-
+  
   if (nrow(dfp) > top_k) {
     dfp <- dfp %>%
       mutate(val = ifelse(row_number() <= top_k, val, "OTHER")) %>%
@@ -693,7 +700,7 @@ plot_cat <- function(col, top_k = 20) {
       summarise(n = sum(n), .groups = "drop") %>%
       arrange(desc(n))
   }
-
+  
   ggplot(dfp, aes(x = reorder(val, n), y = n)) +
     geom_col() +
     coord_flip() +
@@ -710,10 +717,10 @@ for (col in cat_cols) {
   print(plot_cat(col, TOP_K))
 }
 
-# ============================================================
-# 5) Feature engineering decisions encoded INSIDE recipes
+# ============================================================================
+# 7) Feature engineering decisions encoded INSIDE recipes
 #    (so they happen fold-safely during CV)
-# ============================================================
+# ============================================================================
 
 # Education grouping (report-friendly and stable)
 # We'll keep:
@@ -731,9 +738,9 @@ education_group_map <- function(education) {
   )
 }
 
-# ============================================================
-# 6) Recipes
-# ============================================================
+# ============================================================================
+# 8) Recipes
+# ============================================================================
 
 # Common preprocessing steps shared across all models:
 # - Convert strings to factors
@@ -755,7 +762,7 @@ base_rec <- recipe(as.formula(paste(TARGET_COL, "~ .")), data = train_data) %>%
       as.character(native_country) == "unknown" ~ "unknown",
       TRUE ~ "non_US"
     ),
-
+    
     # Hours categories (keep numeric hours_per_week too)
     hours_category = case_when(
       hours_per_week < 35 ~ "part_time",
@@ -763,7 +770,7 @@ base_rec <- recipe(as.formula(paste(TARGET_COL, "~ .")), data = train_data) %>%
       hours_per_week <= 60 ~ "overtime",
       TRUE ~ "extreme_overtime"
     ),
-
+    
     # Capital state + log magnitudes
     capital_state = case_when(
       capital_gain > 0 ~ "gain",
@@ -772,7 +779,7 @@ base_rec <- recipe(as.formula(paste(TARGET_COL, "~ .")), data = train_data) %>%
     ),
     log_capital_gain = log1p(capital_gain),
     log_capital_loss = log1p(capital_loss),
-
+    
     # Education grouping
     education_group = education_group_map(as.character(education))
   ) %>%
@@ -806,9 +813,9 @@ rec_nb <- base_rec %>%
 # Trees do not need normalization.
 rec_rf <- base_rec
 
-# ============================================================
-# 7) Save a bundle for the modeling/tuning script
-# ============================================================
+# ============================================================================
+# 9) Save a bundle for the modeling/tuning script
+# ============================================================================
 
 preprocess_bundle <- list(
   meta = list(
@@ -832,10 +839,10 @@ preprocess_bundle <- list(
 saveRDS(preprocess_bundle, file.path(OUTPUT_DIR, "preprocess_bundle.rds"))
 cat("\nSaved bundle:", file.path(OUTPUT_DIR, "preprocess_bundle.rds"), "\n")
 
-# ============================================================
-# 8) Modeling + Tuning
+# ============================================================================
+# 10) Modeling + Tuning
 # Models: Logistic Regression (glmnet), Naive Bayes, Random Forest (ranger)
-# ============================================================
+# ============================================================================
 
 suppressPackageStartupMessages({
   library(tidyverse)
@@ -1009,12 +1016,12 @@ cat("\nDone.\n")
 cat("Saved tuning results to outputs/models/ and top-10 tables to outputs/reports/.\n")
 cat("Next step: choose thresholds using CV preds, then evaluate once on test.\n")
 
-# ============================================================
-# 09) Threshold Selection + Ensemble (Leakage-safe)
+# ============================================================================
+# 11) Threshold Selection + Ensemble (Leakage-safe)
 # Uses out-of-fold CV predictions from tune_*.rds
 # Objective: choose threshold that maximizes F1 on CV predictions
 # Then save thresholds + curves for reporting.
-# ============================================================
+# ============================================================================
 
 suppressPackageStartupMessages({
   library(tidyverse)
@@ -1055,13 +1062,13 @@ threshold_curve <- function(df, prob_col = ".pred_high_income",
   map_dfr(thresholds, function(t) {
     tmp <- df %>%
       dplyr::mutate(.pred_class = make_class(.data[[prob_col]], t))
-
+    
     m <- thresh_metrics(
       tmp,
       truth = !!sym(truth_col),
       estimate = .pred_class
     )
-
+    
     m %>%
       dplyr::mutate(threshold = t) %>%
       dplyr::select(threshold, .metric, .estimator, .estimate)
@@ -1154,12 +1161,12 @@ saveRDS(threshold_bundle, file.path(OUTPUT_DIR, "models", "threshold_bundle.rds"
 cat("\nSaved:", file.path(OUTPUT_DIR, "models", "threshold_bundle.rds"), "\n")
 cat("Next step: final evaluation on test using the chosen thresholds (no re-selection).\n")
 
-# ============================================================
+# ============================================================================
 # Final TEST Evaluation (Conflict-safe + Version-robust)
 # - Uses frozen thresholds from threshold_bundle.rds if present
 # - Evaluates single models + ensembles on TEST
 # - Writes metrics + confusion matrices to CSV
-# ============================================================
+# ============================================================================
 
 suppressPackageStartupMessages({
   library(tidyverse)
@@ -1189,19 +1196,19 @@ THRESH_BUNDLE_PATH <- file.path(OUTPUT_DIR, "models", "threshold_bundle.rds")
 
 if (file.exists(THRESH_BUNDLE_PATH)) {
   th <- readRDS(THRESH_BUNDLE_PATH)
-
+  
   # Expecting tables with columns: model, threshold
   t_single <- th$best_thresholds_single
   t_ens <- th$best_thresholds_ens
-
+  
   getT <- function(tbl, name, fallback) {
     v <- tbl %>%
       dplyr::filter(model == name) %>%
       dplyr::pull(threshold)
-
+    
     if (length(v) == 0) fallback else v[[1]]
   }
-
+  
   T_LR <- getT(t_single, "LogReg", 0.59)
   T_NB <- getT(t_single, "NaiveBayes", 0.40)
   T_RF <- getT(t_single, "RandomForest", 0.55)
@@ -1237,7 +1244,7 @@ conf_mat_df <- function(cm) {
 eval_from_probs <- function(df, model_name, prob_col, threshold) {
   # Guard common paste typo: ".pred_high_income," or "p_avg,"
   prob_col <- sub(",\\s*$", "", prob_col)
-
+  
   if (!("income_level" %in% names(df))) {
     stop("Missing required column: income_level", call. = FALSE)
   }
@@ -1247,18 +1254,18 @@ eval_from_probs <- function(df, model_name, prob_col, threshold) {
       prob_col, model_name, paste(names(df), collapse = ", ")
     ), call. = FALSE)
   }
-
+  
   df2 <- df %>%
     dplyr::mutate(
       income_level = factor(income_level, levels = c("low_income", "high_income")),
       .pred_high_income = as.numeric(.data[[prob_col]]),
       .pred_class = make_class(.pred_high_income, threshold)
     )
-
+  
   truth <- df2$income_level
   prob <- df2$.pred_high_income
   pred <- df2$.pred_class
-
+  
   metrics_tbl <- tibble::tibble(
     model = model_name,
     threshold = threshold,
@@ -1273,9 +1280,9 @@ eval_from_probs <- function(df, model_name, prob_col, threshold) {
       yardstick::accuracy_vec(truth, pred)
     )
   )
-
+  
   cm <- yardstick::conf_mat(df2, truth = income_level, estimate = .pred_class)
-
+  
   list(metrics = metrics_tbl, conf_mat = cm)
 }
 
@@ -1353,3 +1360,7 @@ cat("\nSaved:\n")
 cat(" - outputs/reports/final_test_metrics.csv\n")
 cat(" - outputs/reports/confmat_test_*.csv\n")
 cat("Done.\n")
+
+# ============================================================================
+# 12) Hypothesis Testing on Models
+# ============================================================================
