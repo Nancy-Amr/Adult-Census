@@ -1,7 +1,7 @@
 library(dplyr)
 
 # Cleaned dataset
-adult <- read.csv("C:/Users/Asus/Downloads/original_cleaned.csv", stringsAsFactors = FALSE)
+adult <- read.csv("C:/Users/Asus/Downloads/train_data.csv", stringsAsFactors = FALSE)
 
 
 # BASIC DATA EXPLORATION
@@ -79,7 +79,7 @@ barplot(prop_gender,
 
 # EDUCATION vs INCOME
 cat("\n=== EDUCATION vs INCOME ===\n")
-edu_income <- table(adult$education_simple, adult$income_level)
+edu_income <- table(adult$education, adult$income_level)
 print(edu_income)
 cat("\nProportions within each education level:\n")
 print(round(prop.table(edu_income, margin = 1) * 100, 2))
@@ -257,94 +257,10 @@ barplot(prop_race,
         las = 1,
         ylim = c(0, 100))
 
-# AGE GROUP vs INCOME
-cat("\n=== AGE GROUP vs INCOME ===\n")
-age_group_income <- table(adult$age_group, adult$income_level)
-print(age_group_income)
-
-# Count plot
-barplot(age_group_income,
-        beside = TRUE,
-        main = "Income Distribution by Age Group",
-        xlab = "Income Level",
-        ylab = "Count",
-        col = rainbow(nrow(age_group_income)),
-        legend.text = rownames(age_group_income),
-        args.legend = list(x = "topleft", cex = 0.7),
-        las = 1)
-
-# Proportion plot
-prop_age <- prop.table(age_group_income, margin = 1) * 100
-barplot(prop_age,
-        beside = TRUE,
-        main = "Income Proportions by Age Group\n(% within each age group)",
-        xlab = "Income Level",
-        ylab = "Percentage (%)",
-        col = rainbow(nrow(age_group_income)),
-        legend.text = rownames(age_group_income),
-        args.legend = list(x = "topleft", cex = 0.7),
-        las = 1,
-        ylim = c(0, 100))
-
-# HOURS CATEGORY vs INCOME
-cat("\n=== HOURS CATEGORY vs INCOME ===\n")
-hours_income <- table(adult$hours_category, adult$income_level)
-print(hours_income)
-
-# Count plot
-barplot(hours_income,
-        beside = TRUE,
-        main = "Income Distribution by Hours Category",
-        xlab = "Income Level",
-        ylab = "Count",
-        col = rainbow(nrow(hours_income)),
-        legend.text = rownames(hours_income),
-        args.legend = list(x = "topright", cex = 0.7),
-        las = 1)
-
-# Proportion plot
-prop_hours <- prop.table(hours_income, margin = 1) * 100
-barplot(prop_hours,
-        beside = TRUE,
-        main = "Income Proportions by Hours Category\n(% within each category)",
-        xlab = "Income Level",
-        ylab = "Percentage (%)",
-        col = rainbow(nrow(hours_income)),
-        legend.text = rownames(hours_income),
-        args.legend = list(x = "topright", cex = 0.7),
-        las = 1,
-        ylim = c(0, 100))
-
-# HAS CAPITAL vs INCOME
-cat("\n=== HAS CAPITAL vs INCOME ===\n")
-capital_income <- table(adult$has_capital, adult$income_level)
-print(capital_income)
-
-# Count plot
-barplot(capital_income,
-        beside = TRUE,
-        main = "Income Distribution by Capital Ownership",
-        xlab = "Income Level",
-        ylab = "Count",
-        col = c("coral", "skyblue"),
-        legend.text = rownames(capital_income),
-        args.legend = list(x = "topright", cex = 0.9))
-
-# Proportion plot
-prop_capital <- prop.table(capital_income, margin = 1) * 100
-barplot(prop_capital,
-        beside = TRUE,
-        main = "Income Proportions by Capital Ownership\n(% within each group)",
-        xlab = "Income Level",
-        ylab = "Percentage (%)",
-        col = c("coral", "skyblue"),
-        legend.text = rownames(capital_income),
-        args.legend = list(x = "topright", cex = 0.9),
-        ylim = c(0, 100))
 
 # COUNTRY REGION vs INCOME
 cat("\n=== COUNTRY REGION vs INCOME ===\n")
-region_income <- table(adult$country_region, adult$income_level)
+region_income <- table(adult$native_country, adult$income_level)
 print(region_income)
 
 # Count plot
@@ -355,7 +271,7 @@ barplot(region_income,
         ylab = "Count",
         col = rainbow(nrow(region_income)),
         legend.text = rownames(region_income),
-        args.legend = list(x = "topright", cex = 0.7),
+        args.legend = list(x = "topleft", cex = 0.6),
         las = 1)
 
 # Proportion plot
@@ -367,7 +283,7 @@ barplot(prop_region,
         ylab = "Percentage (%)",
         col = rainbow(nrow(region_income)),
         legend.text = rownames(region_income),
-        args.legend = list(x = "topright", cex = 0.7),
+        args.legend = list(x = "topleft", cex = 0.3),
         las = 1,
         ylim = c(0, 100))
 
@@ -524,6 +440,8 @@ hist(adult$hours_per_week, breaks = 30, main = "Hours per Week",
      xlab = "Hours", col = "orange", border = "white")
 hist(adult$capital_loss[adult$capital_loss > 0], breaks = 30, 
      main = "Capital Loss (>0)", xlab = "Amount", col = "pink", border = "white")
+hist(adult$capital_gain[adult$capital_gain > 0], breaks = 30, 
+     main = "Capital gain (>0)", xlab = "Amount", col = "pink", border = "white")
 plot(density(adult$age), main = "Age Density", xlab = "Age", 
      col = "darkblue", lwd = 2)
 par(mfrow = c(1, 1))
